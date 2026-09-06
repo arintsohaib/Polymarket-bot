@@ -104,7 +104,7 @@ export function ActivityLog({ logs }: ActivityLogProps) {
           </div>
         ) : (
           filteredLogs.map((log) => {
-            const style = LOG_STYLES[log.level];
+            const style = LOG_STYLES[log.level] ?? LOG_STYLES.INFO;
             return (
               <div
                 key={log.id}
@@ -112,7 +112,7 @@ export function ActivityLog({ logs }: ActivityLogProps) {
                 onClick={() => setExpanded(expanded === log.id ? null : log.id)}
               >
                 <div className="flex items-start gap-3">
-                  <span className="text-base flex-shrink-0">{LOG_ICONS[log.level]}</span>
+                  <span className="text-base flex-shrink-0">{LOG_ICONS[log.level] ?? '•'}</span>
                   <span className="text-xs text-gray-500 font-mono w-16 flex-shrink-0 pt-0.5">
                     {formatTime(log.timestamp)}
                   </span>

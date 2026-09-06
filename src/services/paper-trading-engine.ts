@@ -444,7 +444,7 @@ export class PaperTradingEngine {
     this.recordTrade(p, orderType, shares, avgPrice, -(spend + this.gasPerFillUsd));
     this.persist();
 
-    this.log('FILL' as string, `BUY ${shares} @ $${avgPrice.toFixed(4)} for $${spend.toFixed(2)} (paper)`, {
+    this.log('TRADE', `BUY ${shares} @ $${avgPrice.toFixed(4)} for $${spend.toFixed(2)} (paper)`, {
       tokenId: p.tokenId.slice(0, 14) + '…',
       source: p.source || 'manual',
     });
@@ -517,7 +517,7 @@ export class PaperTradingEngine {
     this.recordTrade(p, orderType, filled, avgPrice, proceeds - this.gasPerFillUsd, realizedPnl);
     this.persist();
 
-    this.log('FILL' as string, `SELL ${filled} @ $${avgPrice.toFixed(4)} for $${proceeds.toFixed(2)} · PnL ${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)} (paper)`, {
+    this.log('TRADE', `SELL ${filled} @ $${avgPrice.toFixed(4)} for $${proceeds.toFixed(2)} · PnL ${realizedPnl >= 0 ? '+' : ''}$${realizedPnl.toFixed(2)} (paper)`, {
       tokenId: p.tokenId.slice(0, 14) + '…',
       source: p.source || 'manual',
     });

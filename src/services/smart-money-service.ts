@@ -690,6 +690,10 @@ export class SmartMoneyService {
 
   private activeSubscription: { unsubscribe: () => void } | null = null;
   private tradeHandlers: Set<(trade: SmartMoneyTrade) => void> = new Set();
+  /** Dedupe guard: the activity stream delivers the same trade via both the
+   *  'trades' and 'orders_matched' types - each real-world trade must be
+   *  processed (and copied) exactly once. */
+  private recentTradeKeys: Set<string> = new Set();
 
   constructor(
     walletService: WalletService,
@@ -843,6 +847,20 @@ export class SmartMoneyService {
   ): Promise<void> {
     const rawAddress = trade.trader?.address;
     if (!rawAddress) return;
+
+    // Dedupe: execute each real-world trade exactly once (see recentTradeKeys)
+    const dedupeKey = `${trade.transactionHash}|${trade.side}|${trade.size}`;
+    if (this.recentTradeKeys.has(dedupeKey)) return;
+    this.recentTradeKeys.add(dedupeKey);
+    if (this.recentTradeKeys.size > 500) {
+      // keep the set bounded (drop oldest half)
+      const iter = this.recentTradeKeys.values();
+      for (let i = 0; i < 250; i++) {
+        const oldest = iter.next().value;
+        if (oldest === undefined) break;
+        this.recentTradeKeys.delete(oldest);
+      }
+    }
 
     const traderAddress = rawAddress.toLowerCase();
 

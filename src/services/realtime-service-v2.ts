@@ -21,6 +21,18 @@ import {
   ConnectionStatus,
 } from '@polymarket/real-time-data-client';
 import type { PriceUpdate, BookUpdate, Orderbook, OrderbookLevel } from '../core/types.js';
+import WebSocket from 'ws';
+
+/**
+ * Direct CLOB market-data WebSocket.
+ *
+ * Polymarket deprecated the `clob_market` topic on the shared live-data host
+ * (wss://ws-live-data.polymarket.com): the server now replies with a 400
+ * "CLOB messages are not supported anymore" frame. Market data (orderbooks,
+ * price changes, last trades) must be consumed from the dedicated CLOB
+ * WebSocket endpoint, while activity/user/crypto topics remain on live-data.
+ */
+const CLOB_WS_HOST = 'wss://ws-subscriptions-clob.polymarket.com/ws/market';
 
 // ============================================================================
 // Types
@@ -262,6 +274,16 @@ export class RealtimeServiceV2 extends EventEmitter {
   // Store subscription messages for reconnection
   private subscriptionMessages: Map<string, { subscriptions: Array<{ topic: string; type: string; filters?: string; clob_auth?: ClobApiKeyCreds }> }> = new Map();
 
+  // ---- Direct CLOB market-data transport (wss://ws-subscriptions-clob...) ----
+  private clobWs: WebSocket | null = null;
+  private clobConnected = false;
+  private clobReconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private clobPingTimer: ReturnType<typeof setInterval> | null = null;
+  /** subId -> assets, for every market subscription routed to the CLOB socket */
+  private clobSubs: Map<string, { assets: string[] }> = new Map();
+  /** subId -> watchdog timer, cleared when the first book event for its assets arrives */
+  private clobWatchdogs: Map<string, ReturnType<typeof setTimeout>> = new Map();
+
   // Caches
   private priceCache: Map<string, PriceUpdate> = new Map();
   private bookCache: Map<string, OrderbookSnapshot> = new Map();
@@ -312,6 +334,9 @@ export class RealtimeServiceV2 extends EventEmitter {
       this.subscriptions.clear();
       this.subscriptionMessages.clear();  // Clear reconnection list
     }
+    this.closeClob();
+    this.clobSubs.clear();
+    this.clearAllClobWatchdogs();
   }
 
   /**
@@ -332,20 +357,9 @@ export class RealtimeServiceV2 extends EventEmitter {
    */
   subscribeMarkets(tokenIds: string[], handlers: MarketDataHandlers = {}): MarketSubscription {
     const subId = `market_${++this.subscriptionIdCounter}`;
-    const filterStr = JSON.stringify(tokenIds);
 
-    // Subscribe to all market data types
-    const subscriptions = [
-      { topic: 'clob_market', type: 'agg_orderbook', filters: filterStr },
-      { topic: 'clob_market', type: 'price_change', filters: filterStr },
-      { topic: 'clob_market', type: 'last_trade_price', filters: filterStr },
-      { topic: 'clob_market', type: 'tick_size_change', filters: filterStr },
-    ];
-
-    const subMsg = { subscriptions };
-    this.sendSubscription(subMsg);
-    this.subscriptionMessages.set(subId, subMsg);  // Store for reconnection
-
+    // Market data is consumed from the dedicated CLOB WebSocket because the
+    // shared live-data host rejects clob_market subscriptions (HTTP 400).
     // Register handlers
     const orderbookHandler = (book: OrderbookSnapshot) => {
       if (tokenIds.includes(book.assetId)) {
@@ -376,6 +390,12 @@ export class RealtimeServiceV2 extends EventEmitter {
     this.on('lastTrade', lastTradeHandler);
     this.on('tickSizeChange', tickSizeHandler);
 
+    // Route this subscription through the direct CLOB socket
+    this.clobSubs.set(subId, { assets: [...tokenIds] });
+    this.connectClob();
+    this.refreshClobSubscription(true);
+    this.armClobWatchdog(subId);
+
     const subscription: MarketSubscription = {
       id: subId,
       topic: 'clob_market',
@@ -386,9 +406,14 @@ export class RealtimeServiceV2 extends EventEmitter {
         this.off('priceChange', priceChangeHandler);
         this.off('lastTrade', lastTradeHandler);
         this.off('tickSizeChange', tickSizeHandler);
-        this.sendUnsubscription({ subscriptions });
+        this.clobSubs.delete(subId);
+        this.clearClobWatchdog(subId);
+        if (this.clobSubs.size === 0) {
+          this.closeClob();
+        } else {
+          this.refreshClobSubscription(false);
+        }
         this.subscriptions.delete(subId);
-        this.subscriptionMessages.delete(subId);  // Remove from reconnection list
       },
     };
 
@@ -899,6 +924,7 @@ export class RealtimeServiceV2 extends EventEmitter {
 
   private handleConnect(client: RealTimeDataClient): void {
     this.connected = true;
+    this.installLiveMessageGuard();
     this.log('Connected to WebSocket server');
 
     // Re-subscribe to all active subscriptions on reconnect
@@ -1221,6 +1247,206 @@ export class RealtimeServiceV2 extends EventEmitter {
       midpoint,
       spread,
       timestamp: book.timestamp,
+    };
+  }
+
+  // ==========================================================================
+  // Direct CLOB market-data transport
+  // ==========================================================================
+
+  /**
+   * Open the dedicated CLOB market WebSocket.
+   * The shared live-data host no longer serves clob_market topics.
+   */
+  private connectClob(): void {
+    if (this.clobWs || this.clobReconnectTimer) return;
+    try {
+      const ws = new WebSocket(CLOB_WS_HOST);
+      this.clobWs = ws;
+
+      ws.on('open', () => {
+        this.clobConnected = true;
+        this.log('CLOB market socket connected');
+        this.refreshClobSubscription(true);
+        this.startClobPing();
+      });
+
+      ws.on('message', (data: unknown) => {
+        this.handleClobMessage(String(data));
+      });
+
+      ws.on('close', () => {
+        this.clobConnected = false;
+        this.stopClobPing();
+        this.clobWs = null;
+        if (this.config.autoReconnect && this.clobSubs.size > 0) {
+          this.log('CLOB market socket closed, reconnecting in 5s...');
+          this.clobReconnectTimer = setTimeout(() => {
+            this.clobReconnectTimer = null;
+            this.connectClob();
+          }, 5000);
+        }
+      });
+
+      ws.on('error', (err: Error) => {
+        this.emit('error', new Error(`CLOB market WebSocket error: ${err.message}`));
+      });
+    } catch (err) {
+      this.emit('error', new Error(`Failed to open CLOB market WebSocket: ${(err as Error).message}`));
+    }
+  }
+
+  private closeClob(): void {
+    if (this.clobReconnectTimer) {
+      clearTimeout(this.clobReconnectTimer);
+      this.clobReconnectTimer = null;
+    }
+    this.stopClobPing();
+    if (this.clobWs) {
+      try { this.clobWs.close(); } catch { /* ignore */ }
+      this.clobWs = null;
+    }
+    this.clobConnected = false;
+  }
+
+  private startClobPing(): void {
+    this.stopClobPing();
+    // Keepalive per Polymarket CLOB WebSocket documentation
+    this.clobPingTimer = setInterval(() => {
+      if (this.clobWs && this.clobConnected) {
+        try { this.clobWs.send('PING'); } catch { /* ignore */ }
+      }
+    }, 50000);
+  }
+
+  private stopClobPing(): void {
+    if (this.clobPingTimer) {
+      clearInterval(this.clobPingTimer);
+      this.clobPingTimer = null;
+    }
+  }
+
+  /** (Re)send the full market subscription set to the CLOB socket. */
+  private refreshClobSubscription(withInitialDump: boolean): void {
+    if (!this.clobWs || !this.clobConnected) return;
+    const assets = new Set<string>();
+    for (const sub of this.clobSubs.values()) {
+      for (const a of sub.assets) assets.add(a);
+    }
+    if (assets.size === 0) return;
+    try {
+      this.clobWs.send(JSON.stringify({ type: 'market', assets_ids: [...assets], initial_dump: withInitialDump }));
+    } catch (err) {
+      this.emit('error', new Error(`Failed to send CLOB subscription: ${(err as Error).message}`));
+    }
+  }
+
+  /** Parse CLOB market frames (book / price_change / last_trade_price / tick_size_change). */
+  private handleClobMessage(raw: string): void {
+    if (!raw || raw === 'PONG' || raw === 'PING') return;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    const messages = (Array.isArray(parsed) ? parsed : [parsed]) as Array<Record<string, unknown>>;
+    const now = Date.now();
+
+    for (const m of messages) {
+      const eventType = typeof m.event_type === 'string' ? m.event_type : '';
+      switch (eventType) {
+        case 'book': {
+          const book = this.parseOrderbook(m, now);
+          this.bookCache.set(book.assetId, book);
+          this.clearClobWatchdogsForAsset(book.assetId);
+          this.emit('orderbook', book);
+          break;
+        }
+        case 'price_change': {
+          const changes = (m.changes as Array<{ price: string; size: string }> | undefined) || [];
+          this.emit('priceChange', {
+            assetId: (m.asset_id as string) || '',
+            changes,
+            timestamp: this.normalizeTimestamp(m.timestamp) || now,
+          });
+          break;
+        }
+        case 'last_trade_price': {
+          const trade = this.parseLastTrade(m, now);
+          this.lastTradeCache.set(trade.assetId, trade);
+          this.emit('lastTrade', trade);
+          break;
+        }
+        case 'tick_size_change': {
+          this.emit('tickSizeChange', this.parseTickSizeChange(m, now));
+          break;
+        }
+        default:
+          break;
+      }
+    }
+  }
+
+  /**
+   * Fail-loud watchdog: emit an error if no orderbook data arrives for a
+   * subscription within 15 seconds (e.g. if the endpoint changes again).
+   */
+  private armClobWatchdog(subId: string): void {
+    this.clearClobWatchdog(subId);
+    const sub = this.clobSubs.get(subId);
+    if (!sub || sub.assets.length === 0) return;
+    const timer = setTimeout(() => {
+      this.clobWatchdogs.delete(subId);
+      const message = `No CLOB market data received for subscription ${subId} (${sub.assets.length} assets) within 15s`;
+      console.warn(`[RealtimeService] WARNING: ${message}`);
+      this.emit('error', new Error(message));
+    }, 15000);
+    this.clobWatchdogs.set(subId, timer);
+  }
+
+  private clearClobWatchdog(subId: string): void {
+    const timer = this.clobWatchdogs.get(subId);
+    if (timer) {
+      clearTimeout(timer);
+      this.clobWatchdogs.delete(subId);
+    }
+  }
+
+  private clearClobWatchdogsForAsset(assetId: string): void {
+    for (const [subId, sub] of this.clobSubs) {
+      if (sub.assets.includes(assetId)) {
+        this.clearClobWatchdog(subId);
+      }
+    }
+  }
+
+  private clearAllClobWatchdogs(): void {
+    for (const timer of this.clobWatchdogs.values()) clearTimeout(timer);
+    this.clobWatchdogs.clear();
+  }
+
+  /**
+   * Fail-loud guard for the shared live-data socket: the SDK only forwards
+   * frames containing "payload" and silently drops server rejections such as
+   * {"body":{"message":"CLOB messages are not supported anymore..."},"statusCode":400}.
+   * Surface them as errors instead of losing them in console noise.
+   */
+  private installLiveMessageGuard(): void {
+    const ws = (this.client as unknown as {
+      ws?: { onmessage: ((ev: { data: unknown }) => void) | null; __liveGuard?: boolean };
+    }).ws;
+    if (!ws || ws.__liveGuard) return;
+    const original = ws.onmessage;
+    ws.__liveGuard = true;
+    ws.onmessage = (ev: { data: unknown }) => {
+      const data = typeof ev.data === 'string' ? ev.data : '';
+      if (data.includes('not supported') && data.includes('statusCode')) {
+        const message = `Polymarket live-data WebSocket rejected a subscription: ${data.slice(0, 160)}`;
+        console.warn(`[RealtimeService] WARNING: ${message}`);
+        this.emit('error', new Error(message));
+      }
+      if (original) original(ev);
     };
   }
 

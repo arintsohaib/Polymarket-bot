@@ -31,4 +31,5 @@ coverage/
 # Cache
 .cache/
 *.tsbuildinfo
-.mcp.json
+.mcp.json# Paper trading runtime state
+data/

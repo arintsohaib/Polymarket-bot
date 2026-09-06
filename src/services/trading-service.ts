@@ -26,6 +26,7 @@ import { Wallet } from 'ethers';
 import { RateLimiter, ApiType } from '../core/rate-limiter.js';
 import type { UnifiedCache } from '../core/unified-cache.js';
 import { CACHE_TTL } from '../core/unified-cache.js';
+import type { PaperTradingEngine } from './paper-trading-engine.js';
 import { PolymarketError, ErrorCode } from '../core/errors.js';
 import type { Side, OrderType } from '../core/types.js';
 
@@ -74,6 +75,10 @@ export interface TradingServiceConfig {
   chainId?: number;
   /** Pre-generated API credentials (optional) */
   credentials?: ApiCredentials;
+  /** Paper-trading mode: route orders to a virtual wallet instead of the CLOB */
+  paperMode?: boolean;
+  /** Paper trading engine instance (required when paperMode is true) */
+  paperEngine?: PaperTradingEngine;
 }
 
 // Order types
@@ -164,6 +169,8 @@ export class TradingService {
   private initialized = false;
   private tickSizeCache: Map<string, string> = new Map();
   private negRiskCache: Map<string, boolean> = new Map();
+  private paperMode = false;
+  private paperEngine: PaperTradingEngine | null = null;
 
   constructor(
     private rateLimiter: RateLimiter,
@@ -173,6 +180,17 @@ export class TradingService {
     this.wallet = new Wallet(config.privateKey);
     this.chainId = (config.chainId || POLYGON_MAINNET) as Chain;
     this.credentials = config.credentials || null;
+    this.paperMode = !!config.paperMode;
+    this.paperEngine = config.paperEngine || null;
+  }
+
+  /**
+   * Attach a paper trading engine after construction (used by PolymarketSDK
+   * when the engine needs services that are created after TradingService).
+   */
+  setPaperEngine(engine: PaperTradingEngine): void {
+    this.paperEngine = engine;
+    this.paperMode = true;
   }
 
   // ============================================================================
@@ -181,6 +199,15 @@ export class TradingService {
 
   async initialize(): Promise<void> {
     if (this.initialized) return;
+
+    // Paper mode: only a public (L1) client is created. No API credentials are
+    // derived and no authenticated CLOB calls are possible - orders are routed
+    // to the paper engine.
+    if (this.paperMode) {
+      this.clobClient = new ClobClient(CLOB_HOST, this.chainId, this.wallet);
+      this.initialized = true;
+      return;
+    }
 
     // Create CLOB client with L1 auth (wallet)
     this.clobClient = new ClobClient(CLOB_HOST, this.chainId, this.wallet);
@@ -304,6 +331,10 @@ export class TradingService {
       };
     }
 
+    if (this.paperMode && this.paperEngine) {
+      return this.paperEngine.submitLimitOrder({ ...params, source: 'trading-service' });
+    }
+
     const client = await this.ensureInitialized();
 
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
@@ -365,6 +396,10 @@ export class TradingService {
       };
     }
 
+    if (this.paperMode && this.paperEngine) {
+      return this.paperEngine.submitMarketOrder({ ...params, source: 'trading-service' });
+    }
+
     const client = await this.ensureInitialized();
 
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
@@ -413,6 +448,9 @@ export class TradingService {
   // ============================================================================
 
   async cancelOrder(orderId: string): Promise<OrderResult> {
+    if (this.paperMode && this.paperEngine) {
+      return this.paperEngine.cancelOrder(orderId);
+    }
     const client = await this.ensureInitialized();
 
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
@@ -429,6 +467,9 @@ export class TradingService {
   }
 
   async cancelOrders(orderIds: string[]): Promise<OrderResult> {
+    if (this.paperMode && this.paperEngine) {
+      return this.paperEngine.cancelOrders(orderIds);
+    }
     const client = await this.ensureInitialized();
 
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
@@ -445,6 +486,9 @@ export class TradingService {
   }
 
   async cancelAllOrders(): Promise<OrderResult> {
+    if (this.paperMode && this.paperEngine) {
+      return this.paperEngine.cancelAllOrders();
+    }
     const client = await this.ensureInitialized();
 
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
@@ -461,6 +505,9 @@ export class TradingService {
   }
 
   async getOpenOrders(marketId?: string): Promise<Order[]> {
+    if (this.paperMode && this.paperEngine) {
+      return this.paperEngine.getOpenOrders();
+    }
     const client = await this.ensureInitialized();
 
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {
@@ -486,6 +533,9 @@ export class TradingService {
   }
 
   async getTrades(marketId?: string): Promise<TradeInfo[]> {
+    if (this.paperMode && this.paperEngine) {
+      return this.paperEngine.getTrades();
+    }
     const client = await this.ensureInitialized();
 
     return this.rateLimiter.execute(ApiType.CLOB_API, async () => {

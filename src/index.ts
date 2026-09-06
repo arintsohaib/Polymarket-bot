@@ -199,6 +199,7 @@ export type {
 
 // DipArbService - Dip Arbitrage for 15m/5m UP/DOWN markets
 export { DipArbService } from './services/dip-arb-service.js';
+export { PaperTradingEngine } from './services/paper-trading-engine.js';
 export type {
   DipArbServiceConfig,
   DipArbMarketConfig,
@@ -385,6 +386,7 @@ import { SubgraphClient } from './clients/subgraph.js';
 import { WalletService } from './services/wallet-service.js';
 import { MarketService } from './services/market-service.js';
 import { TradingService } from './services/trading-service.js';
+import { PaperTradingEngine } from './services/paper-trading-engine.js';
 import { RealtimeServiceV2 } from './services/realtime-service-v2.js';
 import { SmartMoneyService } from './services/smart-money-service.js';
 import { BinanceService } from './services/binance-service.js';
@@ -417,6 +419,9 @@ export class PolymarketSDK {
   // Initialization state
   private _initialized = false;
 
+  /** Paper trading engine (virtual wallet) — null unless paperTrading is enabled */
+  public paper: PaperTradingEngine | null = null;
+
   constructor(config: PolymarketSDKConfig = {}) {
     // Initialize infrastructure
     this.rateLimiter = new RateLimiter();
@@ -435,6 +440,19 @@ export class PolymarketSDK {
       chainId: config.chainId,
       credentials: config.creds,
     });
+
+    // Paper trading engine (virtual wallet filled against live orderbooks).
+    // getOrderbook/getMarket are lazy-bound: markets is created below.
+    if (config.paperTrading) {
+      this.paper = new PaperTradingEngine({
+        startingUsdc: parseFloat(process.env.PAPER_STARTING_BALANCE_USD || process.env.CAPITAL_USD || '250'),
+        startingMatic: parseFloat(process.env.PAPER_STARTING_MATIC || '10'),
+        gasPerFillUsd: parseFloat(process.env.PAPER_GAS_PER_FILL_USD || '0.03'),
+        getOrderbook: (tokenId: string) => this.markets.getTokenOrderbook(tokenId),
+        getMarket: (conditionId: string) => this.markets.getMarket(conditionId) as any,
+      });
+      this.tradingService.setPaperEngine(this.paper);
+    }
 
     this.subgraph = new SubgraphClient(this.rateLimiter, this.cache);
 
@@ -546,6 +564,7 @@ export class PolymarketSDK {
    * Stop SDK - disconnect all services and clean up
    */
   stop(): void {
+    this.paper?.stop();
     this.dipArb.stop();
     this.smartMoney.disconnect();
     this.realtime.disconnect();

@@ -119,6 +119,13 @@ export interface PolySDKOptions {
     secret: string;
     passphrase: string;
   };
+
+  /**
+   * Paper-trading mode: orders are executed against a virtual wallet using
+   * live market prices. No private key or CLOB credentials are required and
+   * no real orders can ever be submitted.
+   */
+  paperTrading?: boolean;
 }
 
 // K-Line interval types

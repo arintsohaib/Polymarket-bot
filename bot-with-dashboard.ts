@@ -21,6 +21,7 @@ import { CTFClient } from './src/clients/ctf-client.js';
 import { startDashboard, dashboardEmitter } from './src/dashboard/index.js';
 import type { BotState, BotConfig, LogLevel, DipArbSignal, SmartMoneySignal } from './src/dashboard/types.js';
 import { addSession, createSessionFromState, type TradeRecord } from './src/dashboard/session-history.js';
+import type { PaperTradingEngine } from './src/services/paper-trading-engine.js';
 
 // ============================================================================
 // CONFIGURATION (same as bot-config.ts)
@@ -138,6 +139,13 @@ let CONFIG = {
 
   dryRun: process.env.DRY_RUN !== 'false',
 };
+
+// Paper trading: virtual wallet filled against live orderbooks.
+// Only ever active together with DRY_RUN=true (no real orders possible).
+const PAPER_TRADING = CONFIG.dryRun && process.env.PAPER_TRADING === 'true';
+const PAPER_STARTING_BALANCE = parseFloat(process.env.PAPER_STARTING_BALANCE_USD || process.env.CAPITAL_USD || '250');
+const PAPER_STARTING_MATIC = parseFloat(process.env.PAPER_STARTING_MATIC || '10');
+let paperEngine: PaperTradingEngine | null = null;
 
 // ============================================================================
 // STATE
@@ -415,11 +423,20 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
   updateDashboard();
 
   if (qualified.length > 0) {
-    // Subscribe to smart money trades with address filter
+    // Subscribe to smart money trades with address filter (qualified wallets only)
+    const qualifiedLower = new Set(qualified.map(a => a.toLowerCase()));
     sdk.smartMoney.subscribeSmartMoneyTrades(
       async (trade: SmartMoneyTrade) => {
         if (!CONFIG.smartMoney.enabled) return;
         if (!canTrade()) return;
+
+        // Firehose guard: only react to trades from qualified wallets
+        if (!qualifiedLower.has((trade.traderAddress || '').toLowerCase())) return;
+
+        // Remember token -> market mapping for paper settlement
+        if (paperEngine && trade.tokenId && trade.conditionId) {
+          paperEngine.rememberToken(trade.tokenId, trade.conditionId, trade.outcome);
+        }
 
         // ... (inside setupSmartMoney callback)
         // Add to smart money signals for dashboard
@@ -446,15 +463,33 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
         updateDashboard();
 
         // EXECUTION LOGIC
-        if (CONFIG.dryRun) {
-          // ... execution
+        if (CONFIG.dryRun && !PAPER_TRADING) {
+          // Pure monitor mode (no paper wallet): visual simulation only
           simulateTrade(0, 'smartMoney', `Smart Money Copy: ${trade.side} ${trade.size} shares @ ${trade.price}`);
-        } else {
-          // ... live execution
-          // simplified placeholder from original file
-          // ...
         }
+        // Paper & Live modes: execution happens through startAutoCopyTrading()
+        // below - the identical pipeline used for real trading.
       });
+
+    // Real copy-trading pipeline (paper mode: fills land in the virtual wallet)
+    await sdk.smartMoney.startAutoCopyTrading({
+      targetAddresses: qualified,
+      sizeScale: CONFIG.smartMoney.sizeScale,
+      maxSizePerTrade: CONFIG.smartMoney.maxSizePerTrade,
+      maxSlippage: CONFIG.smartMoney.maxSlippage,
+      minTradeSize: CONFIG.smartMoney.minTradeSize,
+      delay: CONFIG.smartMoney.delay,
+      dryRun: false,
+      onTrade: (trade, result) => {
+        if (result.success) {
+          log('TRADE', `Copied ${trade.side} ${trade.marketSlug || ''} from ${trade.traderAddress.slice(0, 8)}...`);
+          recordTrade(0, 'smartMoney');
+        } else if (result.errorMsg) {
+          log('WARN', `Copy failed: ${result.errorMsg}`);
+        }
+      },
+      onError: (err) => log('ERROR', `Copy error: ${err.message}`),
+    });
   }
   isSmartMoneyInitialized = true;
   isSmartMoneyInitializing = false;
@@ -548,7 +583,7 @@ async function setupDipArb(sdk: PolymarketSDK) {
   sdk.dipArb.updateConfig({
     shares: CONFIG.dipArb.shares,
     sumTarget: CONFIG.dipArb.sumTarget,
-    autoExecute: !CONFIG.dryRun,
+    autoExecute: !CONFIG.dryRun || PAPER_TRADING,
     debug: true,
   });
 
@@ -689,6 +724,23 @@ let swapService: SwapService | null = null;
 
 async function updateBalances() {
   if (CONFIG.dryRun) {
+    if (PAPER_TRADING && paperEngine) {
+      // Paper wallet: real virtual balances from the paper engine
+      const b = paperEngine.getBalances();
+      const snap = paperEngine.snapshot();
+      state.usdcEBalance = b.usdc;
+      state.maticBalance = b.matic;
+      state.unrealizedPnL = snap.unrealizedPnl;
+      state.paper = {
+        balance: b.usdc,
+        initialBalance: PAPER_STARTING_BALANCE,
+        pnl: snap.realizedPnl,
+        trades: snap.fills,
+        totalVolume: snap.volume,
+      };
+      updateDashboard();
+      return;
+    }
     // SIMULATION: Mock balances
     // Base 10,000 + whatever PnL we've made in this session
     state.usdcEBalance = 10000 + state.totalPnL;
@@ -934,6 +986,58 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
 
 async function setupPortfolioManager(sdk: PolymarketSDK) {
   log('INFO', 'Starting Portfolio Manager...');
+
+  if (PAPER_TRADING && paperEngine) {
+    log('INFO', '[PAPER] Portfolio Manager tracking virtual paper positions.');
+    const syncPaper = async () => {
+      const positions = paperEngine!.getPositions().map(p => ({
+        asset: p.tokenId,
+        conditionId: p.conditionId,
+        outcome: p.outcome,
+        size: p.shares,
+        avgPrice: p.avgCost,
+        title: p.outcome ? `${p.outcome} (paper)` : `paper ${p.tokenId.slice(0, 10)}…`,
+      }));
+      const enriched = await Promise.all(positions.map(async (pos: any) => {
+        try {
+          if (!pos.conditionId) return pos;
+          const market = await sdk.markets.getMarket(pos.conditionId);
+          if (market) {
+            pos.marketClosed = (market as any).closed;
+            const token = (market as any).tokens?.find((t: any) => t.tokenId === pos.asset);
+            if (token) {
+              pos.isWinner = token.winner || false;
+              pos.curPrice = token.price || 0;
+            }
+          }
+        } catch { /* ignore market fetch errors */ }
+        return pos;
+      }));
+      state.positions = enriched;
+      let unrealized = 0;
+      for (const p of enriched) {
+        const cur = Number(p.curPrice) || 0;
+        if (cur > 0) unrealized += (cur - Number(p.avgPrice)) * Number(p.size);
+      }
+      state.unrealizedPnL = unrealized;
+      const b = paperEngine!.getBalances();
+      state.usdcEBalance = b.usdc;
+      state.maticBalance = b.matic;
+      const snap = paperEngine!.snapshot();
+      state.paper = {
+        balance: snap.balances.usdc,
+        initialBalance: PAPER_STARTING_BALANCE,
+        pnl: snap.realizedPnl,
+        trades: snap.fills,
+        totalVolume: snap.volume,
+      };
+      updateDashboard();
+    };
+    await syncPaper();
+    setInterval(syncPaper, 15000);
+    return;
+  }
+
   if (!process.env.POLYMARKET_PRIVATE_KEY) {
     log('INFO', 'Demo Mode: No private key configured, portfolio position sync skipped.');
     updateDashboard();
@@ -1156,15 +1260,23 @@ async function main() {
       trades: 0,
       totalVolume: 0,
     };
-    log('INFO', '📝 Paper Trading Activated: Simulating trades with $250 initial capital');
+    log('INFO', `📝 Paper Trading Activated: Simulating trades with $${PAPER_STARTING_BALANCE} initial capital`);
     updateDashboard();
   }
 
   const sdk = await PolymarketSDK.create({
     privateKey: process.env.POLYMARKET_PRIVATE_KEY || undefined,
+    paperTrading: PAPER_TRADING,
   });
 
-  log('INFO', `Wallet: ${sdk.tradingService.getAddress()}${!process.env.POLYMARKET_PRIVATE_KEY ? ' [DEMO READ-ONLY WALLET]' : ''}`);
+  if (PAPER_TRADING && sdk.paper) {
+    paperEngine = sdk.paper;
+    paperEngine.setLogger((level, message, data) => log(level as LogLevel, `[PAPER] ${message}`, data));
+    const bal = paperEngine.getBalances();
+    log('INFO', `💼 [PAPER WALLET] $${bal.usdc.toFixed(2)} USDC.e · ${bal.matic} MATIC virtual (real trading disabled)`);
+  }
+
+  log('INFO', `Wallet: ${sdk.tradingService.getAddress()}${!process.env.POLYMARKET_PRIVATE_KEY ? ' [DEMO READ-ONLY WALLET]' : ''}${PAPER_TRADING ? ' [PAPER WALLET]' : ''}`);
 
   // Setup all services
   await setupOnchain(); // MUST BE FIRST (Approvals)

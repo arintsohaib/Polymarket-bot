@@ -61,7 +61,7 @@ let CONFIG = {
   },
 
   smartMoney: {
-    enabled: process.env.SMARTMONEY_ENABLED !== 'false',
+    enabled: process.env.SMARTMONEY_ENABLED === 'true',
     topN: 20,
     // 🔴 FIXED: Stricter criteria (v3.1)
     minWinRate: 0.60,  // Up from 0.70 to match bot-config (60%+)
@@ -652,7 +652,7 @@ async function setupDipArb(sdk: PolymarketSDK) {
   });
 
   // Enable auto-rotate if configured
-  if (CONFIG.dipArb.autoRotate) {
+  if (CONFIG.dipArb.enabled && CONFIG.dipArb.autoRotate) {
     sdk.dipArb.enableAutoRotate({
       enabled: true,
       underlyings: ['ETH', 'BTC', 'SOL'],
@@ -740,7 +740,8 @@ async function setupSwap() {
     if (!process.env.POLYMARKET_PRIVATE_KEY) return;
 
     // Create SwapService with signer
-    const provider = new ethers.providers.JsonRpcProvider('https://polygon-rpc.com');
+    const rpcUrl = process.env.POLYGON_RPC_URL || 'https://polygon-bor-rpc.publicnode.com';
+    const provider = new ethers.providers.JsonRpcProvider(rpcUrl);
     const signer = new ethers.Wallet(process.env.POLYMARKET_PRIVATE_KEY, provider);
     swapService = new SwapService(signer);
 
@@ -776,7 +777,7 @@ async function setupOnchain() {
 
     const onchain = new OnchainService({
       privateKey: process.env.POLYMARKET_PRIVATE_KEY,
-      rpcUrl: 'https://polygon-rpc.com',
+      rpcUrl: process.env.POLYGON_RPC_URL || 'https://polygon-bor-rpc.publicnode.com',
     });
 
     if (CONFIG.onchain.autoApprove) {
@@ -933,6 +934,11 @@ async function setupDirectTrading(sdk: PolymarketSDK) {
 
 async function setupPortfolioManager(sdk: PolymarketSDK) {
   log('INFO', 'Starting Portfolio Manager...');
+  if (!process.env.POLYMARKET_PRIVATE_KEY) {
+    log('INFO', 'Demo Mode: No private key configured, portfolio position sync skipped.');
+    updateDashboard();
+    return;
+  }
 
   // Initial Sync
   try {
@@ -1004,6 +1010,26 @@ async function setupPortfolioManager(sdk: PolymarketSDK) {
   }, 30 * 1000);
 }
 
+
+async function setupLiveMarketFeed(sdk: PolymarketSDK) {
+  log('INFO', '📡 Starting Live Market Data Feed from Polymarket...');
+  const fetchTrending = async () => {
+    try {
+      const trending = await sdk.gammaApi.getTrendingMarkets(3);
+      if (trending && trending.length > 0) {
+        const m = trending[0];
+        const yesPrice = m.outcomePrices && m.outcomePrices[0] ? Number(m.outcomePrices[0]).toFixed(2) : '--';
+        log('INFO', `📡 Live Market Feed: "${m.question.slice(0, 40)}..." | YES: ${yesPrice} | 24h Vol: $${Math.round(m.volume24hr || 0).toLocaleString()}`);
+        updateDashboard();
+      }
+    } catch {
+      // quiet
+    }
+  };
+  await fetchTrending();
+  setInterval(fetchTrending, 30000);
+}
+
 async function main() {
   console.clear();
   console.log('╔════════════════════════════════════════════════════════════════════╗');
@@ -1015,8 +1041,12 @@ async function main() {
   console.log('\n🌐 Dashboard: http://localhost:3001\n');
 
   if (!process.env.POLYMARKET_PRIVATE_KEY) {
-    log('ERROR', 'POLYMARKET_PRIVATE_KEY not found');
-    process.exit(1);
+    if (CONFIG.dryRun) {
+      log('INFO', '🔐 Running in SAFE DEMO / DRY-RUN mode (POLYMARKET_PRIVATE_KEY is unset - real trading disabled)');
+    } else {
+      log('ERROR', 'POLYMARKET_PRIVATE_KEY not found (Required for LIVE trading)');
+      process.exit(1);
+    }
   }
 
   // Send config to dashboard
@@ -1059,6 +1089,10 @@ async function main() {
   dashboardEmitter.on('command', async (cmd: { command: string; payload: any }) => {
     if (cmd.command === 'toggleDryRun') {
       const enable = cmd.payload.enabled;
+      if (!enable && !process.env.POLYMARKET_PRIVATE_KEY) {
+        log('WARN', '🛑 Cannot switch to LIVE mode: POLYMARKET_PRIVATE_KEY is not configured in .env');
+        return;
+      }
       if (CONFIG.dryRun === !enable) {
         log('INFO', `Switching to ${!enable ? 'LIVE' : 'DRY RUN'} mode... (Requested by user)`);
 
@@ -1127,10 +1161,10 @@ async function main() {
   }
 
   const sdk = await PolymarketSDK.create({
-    privateKey: process.env.POLYMARKET_PRIVATE_KEY,
+    privateKey: process.env.POLYMARKET_PRIVATE_KEY || undefined,
   });
 
-  log('INFO', `Wallet: ${sdk.tradingService.getAddress()}`);
+  log('INFO', `Wallet: ${sdk.tradingService.getAddress()}${!process.env.POLYMARKET_PRIVATE_KEY ? ' [DEMO READ-ONLY WALLET]' : ''}`);
 
   // Setup all services
   await setupOnchain(); // MUST BE FIRST (Approvals)
@@ -1147,6 +1181,7 @@ async function main() {
 
   // Setup Direct Trading
   await setupDirectTrading(sdk);
+  await setupLiveMarketFeed(sdk);
 
   // Setup Portfolio Manager (Persistence)
   await setupPortfolioManager(sdk);

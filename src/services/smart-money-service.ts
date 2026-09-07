@@ -149,6 +149,8 @@ export interface AutoCopyTradingOptions {
   minTradeSize?: number;
   /** Only copy BUY or SELL trades */
   sideFilter?: 'BUY' | 'SELL';
+  /** Skip BUY copies of tokens priced above this (e.g. 0.95 - flipped favorites) */
+  maxCopyPrice?: number;
 
   /** Dry run mode */
   dryRun?: boolean;
@@ -967,6 +969,7 @@ export class SmartMoneyService {
     const orderType = options.orderType ?? 'FOK';
     const minTradeSize = options.minTradeSize ?? 10;
     const sideFilter = options.sideFilter;
+    const maxCopyPrice = options.maxCopyPrice ?? 0.95;
     const delay = options.delay ?? 0;
     const dryRun = options.dryRun ?? false;
 
@@ -989,6 +992,13 @@ export class SmartMoneyService {
           }
 
           if (sideFilter && trade.side !== sideFilter) {
+            stats.tradesSkipped++;
+            return;
+          }
+
+          // Skip dangerous flipped-favorite copies: buying a heavy favorite
+          // above maxCopyPrice risks a total loss when it loses.
+          if (maxCopyPrice > 0 && trade.side === 'BUY' && trade.price > maxCopyPrice) {
             stats.tradesSkipped++;
             return;
           }
@@ -1047,6 +1057,9 @@ export class SmartMoneyService {
               amount: usdcAmount,
               price: slippagePrice,
               orderType,
+              conditionId: trade.conditionId,
+              outcome: trade.outcome,
+              source: 'smartMoney',
             });
           }
 

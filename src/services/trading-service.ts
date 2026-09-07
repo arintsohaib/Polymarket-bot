@@ -97,6 +97,12 @@ export interface MarketOrderParams {
   amount: number;
   price?: number;
   orderType?: 'FOK' | 'FAK';
+  /** Market condition ID (metadata for paper fills/settlement) */
+  conditionId?: string;
+  /** Outcome label of the token (e.g. 'Yes', 'Over', team name) */
+  outcome?: string;
+  /** Strategy tag for reporting (e.g. 'smartMoney', 'dipArb') */
+  source?: string;
 }
 
 export interface Order {

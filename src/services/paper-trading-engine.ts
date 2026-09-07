@@ -56,6 +56,7 @@ export interface PaperMarketOrderParams {
   price?: number;
   orderType?: 'FOK' | 'FAK';
   conditionId?: string;
+  outcome?: string;
   source?: string;
 }
 
@@ -430,11 +431,12 @@ export class PaperTradingEngine {
       existing.avgCost = (existing.avgCost * existing.shares + spend) / totalShares;
       existing.shares = totalShares;
     } else {
+      this.rememberToken(p.tokenId, p.conditionId || '', p.outcome);
       const meta = this.tokenMeta.get(p.tokenId);
       this.positions.set(p.tokenId, {
         tokenId: p.tokenId,
         conditionId: p.conditionId || meta?.conditionId || '',
-        outcome: meta?.outcome || '',
+        outcome: p.outcome || meta?.outcome || '',
         shares,
         avgCost: avgPrice,
         openedAt: Date.now(),

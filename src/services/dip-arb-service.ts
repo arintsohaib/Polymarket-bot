@@ -603,6 +603,8 @@ export class DipArbService extends EventEmitter {
           tokenId: signal.tokenId,
           side: 'BUY' as Side,
           amount: amountPerOrder,
+          conditionId: this.market?.conditionId,
+          source: 'dipArb',
         };
 
         if (this.config.debug && splitCount > 1) {
@@ -733,6 +735,8 @@ export class DipArbService extends EventEmitter {
           tokenId: signal.tokenId,
           side: 'BUY' as Side,
           amount: amountPerOrder,
+          conditionId: this.market?.conditionId,
+          source: 'dipArb',
         };
 
         if (this.config.debug && splitCount > 1) {
@@ -1165,6 +1169,8 @@ export class DipArbService extends EventEmitter {
         tokenId: leg1.tokenId,
         side: 'SELL' as Side,
         amount: exitAmount,
+        conditionId: this.market?.conditionId,
+        source: 'dipArb',
       });
 
       if (result.success) {
@@ -2153,6 +2159,8 @@ export class DipArbService extends EventEmitter {
           tokenId: this.currentRound.leg1.tokenId,
           side: 'SELL' as Side,
           amount: leg1Shares,
+          conditionId: this.market?.conditionId,
+          source: 'dipArb',
         });
 
         if (result.success) {

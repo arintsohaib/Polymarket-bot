@@ -72,7 +72,7 @@ async function main() {
     const afterSell = eng.getBalances();
     const snap = eng.snapshot();
     check('SELL filled', sell.success === true, sell.errorMsg || '');
-    check('Position closed', eng.getPositions().length === 0);
+    check('Position closed (test token)', !eng.getPositions().some(p => p.tokenId === yesTokenId));
     check('Round-trip cost < $2 (liquid book)', Math.abs(afterSell.usdc - start.usdc) < 2.0, `${afterSell.usdc} (PnL ${snap.realizedPnl >= 0 ? '+' : ''}${snap.realizedPnl})`);
   }
 

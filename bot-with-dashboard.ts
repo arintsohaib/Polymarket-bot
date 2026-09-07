@@ -478,6 +478,7 @@ async function initializeSmartMoney(sdk: PolymarketSDK) {
       maxSizePerTrade: CONFIG.smartMoney.maxSizePerTrade,
       maxSlippage: CONFIG.smartMoney.maxSlippage,
       minTradeSize: CONFIG.smartMoney.minTradeSize,
+      maxCopyPrice: parseFloat(process.env.SMARTMONEY_MAX_COPY_PRICE || '0.95'),
       delay: CONFIG.smartMoney.delay,
       dryRun: false,
       onTrade: (trade, result) => {
